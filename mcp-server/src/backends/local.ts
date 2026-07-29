@@ -6,8 +6,10 @@ import {
   rmSync,
   createReadStream,
   readFileSync,
+  statSync,
   unlinkSync,
 } from "fs";
+import { cpus } from "os";
 import { createHash } from "crypto";
 import { basename, dirname, join } from "path";
 import { pipeline } from "stream/promises";
@@ -17,6 +19,18 @@ import type { AudioResult, TranscriptionSegment, AudioTag } from "../types.js";
 import type { WhisperEngine, WhisperModel } from "../types.js";
 
 const execFileAsync = promisify(execFile);
+
+// Bare `curl -L` exits 0 on a connection that drops mid-body, leaving a
+// truncated model on disk. --fail rejects HTTP errors, --retry resumes
+// transient failures, and -C - continues a partial file rather than
+// restarting or appending to it.
+const CURL_FETCH_ARGS = [
+  "-L",
+  "--fail",
+  "--retry", "5",
+  "--retry-all-errors",
+  "-C", "-",
+];
 
 function resolveModel(model: WhisperModel): string {
   if (model === "auto") {
@@ -30,6 +44,46 @@ export interface WhisperOptions {
   model: WhisperModel;
   whisperAt: boolean;
   modelDir: string;
+  threads: number | "auto";
+  timeoutMultiplier: number;
+  timeoutMinSeconds: number;
+}
+
+// extractAudio always writes 16 kHz mono pcm_s16le (see extractors/audio.ts),
+// so wall-clock duration is derivable from file size alone — no extra ffprobe
+// spawn just to size a timeout.
+const WAV_BYTES_PER_SECOND = 16_000 * 2 * 1;
+const WAV_HEADER_BYTES = 44;
+
+function audioDurationSeconds(wavPath: string): number {
+  try {
+    const bytes = Math.max(0, statSync(wavPath).size - WAV_HEADER_BYTES);
+    return bytes / WAV_BYTES_PER_SECOND;
+  } catch {
+    return 0;
+  }
+}
+
+// Transcription cost scales with audio length, so a fixed ceiling either kills
+// long videos or lets a wedged process hang forever. Scale with the input and
+// keep a floor for short clips (model load + VAD dominate there).
+function resolveTimeoutMs(
+  wavPath: string,
+  multiplier: number,
+  minSeconds: number,
+): number {
+  const seconds = Math.max(minSeconds, audioDurationSeconds(wavPath) * multiplier);
+  return Math.round(seconds * 1000);
+}
+
+// whisper-cli defaults to 4 threads regardless of available cores. Leave a
+// little headroom so frame extraction running in parallel is not starved.
+function resolveThreads(threads: number | "auto"): number {
+  if (typeof threads === "number" && Number.isFinite(threads) && threads > 0) {
+    return Math.floor(threads);
+  }
+  const available = cpus().length || 4;
+  return Math.max(1, Math.min(available - 2, 16));
 }
 
 export async function transcribeWithWhisper(
@@ -39,15 +93,16 @@ export async function transcribeWithWhisper(
   const { engine, model, whisperAt, modelDir } = options;
 
   if (engine === "cpp") {
-    return transcribeWithWhisperCpp(wavPath, model, modelDir);
+    return transcribeWithWhisperCpp(wavPath, model, modelDir, options);
   }
-  return transcribeWithWhisperPython(wavPath, model, whisperAt);
+  return transcribeWithWhisperPython(wavPath, model, whisperAt, options);
 }
 
 async function transcribeWithWhisperCpp(
   wavPath: string,
   model: string,
   modelDir: string,
+  options: WhisperOptions,
 ): Promise<AudioResult> {
   const resolved = resolveModel(model as WhisperModel);
   const modelPath = `${modelDir}/ggml-${resolved}.bin`;
@@ -74,8 +129,8 @@ async function transcribeWithWhisperCpp(
 
     const downloadUrl = `https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-${resolved}.bin`;
     console.error(`[cvv] Downloading whisper model ggml-${resolved}.bin...`);
-    await execFileAsync("curl", ["-L", "-o", modelPath, downloadUrl], {
-      timeout: 600_000,
+    await execFileAsync("curl", [...CURL_FETCH_ARGS, "-o", modelPath, downloadUrl], {
+      timeout: 1_800_000,
     });
     console.error(`[cvv] Model downloaded to ${modelPath}`);
 
@@ -110,8 +165,8 @@ async function transcribeWithWhisperCpp(
     const vadUrl =
       "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin";
     console.error(`[cvv] Downloading Silero VAD model...`);
-    await execFileAsync("curl", ["-L", "-o", vadModelPath, vadUrl], {
-      timeout: 120_000,
+    await execFileAsync("curl", [...CURL_FETCH_ARGS, "-o", vadModelPath, vadUrl], {
+      timeout: 300_000,
     });
     if (!existsSync(vadModelPath)) {
       throw new Error(`Failed to download VAD model from ${vadUrl}`);
@@ -123,6 +178,13 @@ async function transcribeWithWhisperCpp(
   // prefix via -of so we know where to read from, then read, parse, clean up.
   const outputPrefix = join(dirname(wavPath), basename(wavPath, ".wav"));
 
+  const threads = resolveThreads(options.threads);
+  const timeout = resolveTimeoutMs(
+    wavPath,
+    options.timeoutMultiplier,
+    options.timeoutMinSeconds,
+  );
+
   await execFileAsync(
     "whisper-cli",
     [
@@ -131,10 +193,11 @@ async function transcribeWithWhisperCpp(
       "--output-json",
       "--output-file", outputPrefix,
       "--language", "auto",
+      "--threads", String(threads),
       "--vad",
       "--vad-model", vadModelPath,
     ],
-    { timeout: 600_000, maxBuffer: 50 * 1024 * 1024 },
+    { timeout, maxBuffer: 50 * 1024 * 1024 },
   );
 
   const jsonPath = `${outputPrefix}.json`;
@@ -176,6 +239,7 @@ async function transcribeWithWhisperPython(
   wavPath: string,
   model: string,
   whisperAt: boolean,
+  options: WhisperOptions,
 ): Promise<AudioResult> {
   const command = whisperAt ? "whisper-at" : "whisper";
 
@@ -193,7 +257,15 @@ async function transcribeWithWhisperPython(
     "--model", model,
     "--output_format", "json",
     "--output_dir", outputDir,
-  ], { timeout: 600_000, maxBuffer: 50 * 1024 * 1024 });
+    "--threads", String(resolveThreads(options.threads)),
+  ], {
+    timeout: resolveTimeoutMs(
+      wavPath,
+      options.timeoutMultiplier,
+      options.timeoutMinSeconds,
+    ),
+    maxBuffer: 50 * 1024 * 1024,
+  });
 
   // Best-effort cleanup of the on-disk JSON; we already have what we
   // need on stdout via parseWhisperOutput. The CLI derives the output

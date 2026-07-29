@@ -10,6 +10,9 @@ export interface Config {
   whisper_engine: WhisperEngine;
   whisper_model: WhisperModel;
   whisper_at: boolean;
+  whisper_threads: number | "auto";
+  whisper_timeout_multiplier: number;
+  whisper_timeout_min_seconds: number;
   frame_mode: FrameMode;
   frame_format: FrameFormat;
   frame_resolution: number;

@@ -235,6 +235,9 @@ export function registerVideoAnalyze(server: McpServer): void {
               model: config.whisper_model,
               whisperAt: config.whisper_at,
               modelDir,
+              threads: config.whisper_threads,
+              timeoutMultiplier: config.whisper_timeout_multiplier,
+              timeoutMinSeconds: config.whisper_timeout_min_seconds,
             });
           } else {
             // unconfigured or none — skip transcription gracefully
